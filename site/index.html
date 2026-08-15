@@ -147,10 +147,17 @@
         </tr>
         <tr>
           <td><span class="badge badge-skip">SKIP</span></td>
-          <td>Already inside a tmux pane. Counted, not listed — there is nothing to do.</td>
+          <td>Already inside a tmux pane, or has no controlling terminal. Counted, not listed — there is nothing to do.</td>
         </tr>
       </tbody>
     </table>
+
+    <p>
+      A session with no controlling TTY is not a terminal session at all — the
+      VS Code or JetBrains extension host, a <code>claude -p</code> run, a hook.
+      There is nothing to migrate, and SIGTERMing one would kill a session you
+      cannot see in any tab, so they are excluded before anything else happens.
+    </p>
 
     <p>
       The session you run the command <em>from</em> is always

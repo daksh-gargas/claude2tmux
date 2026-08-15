@@ -80,7 +80,12 @@ something you have to infer:
 |---|---|
 | `MOVE` | SIGTERMed, then relaunched as `claude --resume <id>` in a tmux window at the same cwd |
 | `STAGE` | Window built, resume command typed but **not** entered. Never killed for you |
-| `SKIP` | Already inside a tmux pane. Counted, not listed — nothing to do |
+| `SKIP` | Already inside a tmux pane, or has no controlling terminal. Counted, not listed — nothing to do |
+
+A session with no controlling TTY is not a terminal session at all: the VS Code
+or JetBrains extension host, a `claude -p` run, a hook. There is nothing to
+migrate, and SIGTERMing one would kill a session you cannot see in any tab — so
+they are excluded before anything else happens.
 
 The session you run the command *from* is always `STAGE`, never `MOVE` — killing
 it would abort the migration mid-run. Quit that tab yourself, switch to its

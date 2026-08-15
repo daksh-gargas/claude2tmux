@@ -23,7 +23,8 @@
 #   MOVE   SIGTERMed, then relaunched as `claude --resume <id>` in a tmux window
 #   STAGE  window built, resume command typed but NOT entered — the session
 #          running this script, and everything under --no-kill. Never killed.
-#   SKIP   already inside a tmux pane; not listed, only counted
+#   SKIP   already inside a tmux pane, or has no controlling terminal (editor
+#          extension / headless run); not listed, only counted
 #
 # The Claude session this script is invoked from (if any) is never killed. Its
 # tmux window is created with the resume command typed but NOT executed — quit
@@ -223,9 +224,17 @@ ROWS=$(mktemp "${TMPDIR:-/tmp}/claude2tmux.XXXXXX")
 trap 'rm -f "$ROWS"' EXIT
 
 skipped_intmux=0
+skipped_notty=0
 while read -r pid tty cmd; do
   a0="${cmd%% *}"; [ "${a0##*/}" = "claude" ] || continue
   [ "$pid" = "$$" ] && continue
+  # No controlling terminal (ps prints "??") means this is not a terminal
+  # session at all — the VS Code / JetBrains extension host, a `claude -p` run,
+  # a hook. There is nothing to migrate, and SIGTERMing one would kill a
+  # session the user cannot see in any tab.
+  case "$tty" in
+    ''|'?'|'??') skipped_notty=$((skipped_notty + 1)); continue ;;
+  esac
   # Already inside tmux — nothing to migrate.
   if [ -n "$TMUX_TTYS" ] && printf '%s\n' "$TMUX_TTYS" | grep -qx "$tty"; then
     skipped_intmux=$((skipped_intmux + 1)); continue
@@ -242,6 +251,7 @@ done < <(ps -eo pid= -o tty= -o command=)
 if [ ! -s "$ROWS" ]; then
   echo "claude2tmux: no Claude Code sessions running outside tmux."
   [ "$skipped_intmux" -gt 0 ] && echo "  ($skipped_intmux already in a tmux pane — nothing to do.)"
+  [ "$skipped_notty" -gt 0 ] && echo "  ($skipped_notty with no controlling terminal — editor extension or headless run.)"
   exit 0
 fi
 
@@ -305,6 +315,8 @@ else
   fi
   [ "$skipped_intmux" -gt 0 ] && \
     echo "  ${C_DIM}SKIP  ($skipped_intmux) already in a tmux pane — not touched.${C_RST}"
+  [ "$skipped_notty" -gt 0 ] && \
+    echo "  ${C_DIM}SKIP  ($skipped_notty) no controlling terminal (editor extension / headless) — not touched.${C_RST}"
 fi
 
 if [ "$LIST" -eq 1 ]; then
