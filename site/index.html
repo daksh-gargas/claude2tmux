@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>claude2tmux — move Claude Code sessions into tmux</title>
+<meta name="description" content="Move Claude Code sessions you started in a plain terminal into tmux, so you can detach and reach them over SSH from another machine.">
+<meta name="color-scheme" content="light dark">
+<meta property="og:title" content="claude2tmux">
+<meta property="og:description" content="Move Claude Code sessions from a bare terminal into tmux, so you can reach them over SSH.">
+<meta property="og:type" content="website">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <p class="eyebrow">macOS · zsh · tmux</p>
+    <h1>Your Claude sessions, reachable from anywhere.</h1>
+    <p class="lede">
+      You start three Claude Code sessions in iTerm, get deep into all of them,
+      and then realise none are reachable from anywhere but that one window.
+      <strong>claude2tmux</strong> moves them into tmux — detach, close the
+      laptop, pick them back up over SSH.
+    </p>
+    <div class="cta-row">
+      <a class="btn btn-primary" href="#install">Install</a>
+      <a class="btn" href="https://github.com/daksh-gargas/claude2tmux">View on GitHub</a>
+    </div>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="term">
+    <div class="term-bar">
+      <span class="dot dot-r"></span><span class="dot dot-y"></span><span class="dot dot-g"></span>
+      <span class="term-title">claude2tmux --list</span>
+    </div>
+<pre><span class="t-prompt">$</span> claude2tmux
+
+  Sessions that will move into tmux session <span class="t-path">'claude'</span>:
+
+  <span class="t-move">MOVE </span>  <span class="t-mute">ttys000</span>  pid 39902  <span class="t-mute">-&gt;</span> <span class="t-path">claude:D4G4</span>
+         <span class="t-mute">~/GitHub/D4G4  People don't realise how crappy their sound is…</span>
+  <span class="t-stage">STAGE</span>  <span class="t-mute">ttys001</span>  pid 36339  <span class="t-mute">-&gt;</span> <span class="t-path">claude:dg</span>
+         <span class="t-mute">~  give me a flag which lists the sessions that will be moved</span>
+  <span class="t-move">MOVE </span>  <span class="t-mute">ttys002</span>  pid 30842  <span class="t-mute">-&gt;</span> <span class="t-path">claude:Wildr</span>
+         <span class="t-mute">~/GitHub/Wildr  Theme set to auto</span>
+  <span class="t-move">MOVE </span>  <span class="t-mute">ttys003</span>  pid 30259  <span class="t-mute">-&gt;</span> <span class="t-path">claude:First-Ink</span>
+         <span class="t-mute">~/GitHub/D4G4/First-Ink  lets make a new build</span>
+  <span class="t-move">MOVE </span>  <span class="t-mute">ttys005</span>  pid 57289  <span class="t-mute">-&gt;</span> <span class="t-path">claude:First-Ink-2</span>
+         <span class="t-mute">~/GitHub/D4G4/First-Ink  commit your work to main</span>
+
+  <span class="t-move">MOVE </span> (4) SIGTERMed, then relaunched as claude --resume &lt;id&gt;.
+  <span class="t-stage">STAGE</span> (1) window built, command typed but not entered — you quit the
+        original and press Enter. Never killed for you.
+
+  <span class="t-mute">Listing only. Run --go to perform it.</span></pre>
+  </div>
+</div>
+
+<section id="catch">
+  <div class="wrap">
+    <h2>The catch, up front</h2>
+    <p>
+      It does not move the running process. <strong>A live process's controlling
+      terminal cannot be reassigned on macOS</strong> — the Linux tool for that
+      (<code>reptyr</code>) works by <code>ptrace</code>-ing the target and
+      swapping its TTY, and there is no working macOS equivalent.
+    </p>
+    <p>
+      So claude2tmux migrates the <em>session</em>, not the process. Claude Code
+      appends every message to
+      <code>~/.claude/projects/&lt;slug&gt;/&lt;id&gt;.jsonl</code> as it
+      happens, so killing a session and running
+      <code>claude --resume &lt;id&gt;</code> inside tmux restores the full
+      conversation, working directory, and history.
+    </p>
+    <div class="note">
+      <p>
+        <strong>What survives:</strong> everything already written to the
+        transcript.<br>
+        <strong>What is lost:</strong> a tool call that was in flight at the
+        moment of the kill.
+      </p>
+    </div>
+    <p class="sub">
+      If that trade isn't acceptable for a given session, <code>--no-kill</code>
+      builds its tmux window and stages the resume command without touching the
+      original — you quit it yourself once it's idle.
+    </p>
+  </div>
+</section>
+
+<section id="install">
+  <div class="wrap">
+    <h2>Install</h2>
+
+    <h3>Homebrew</h3>
+    <div class="cmd"><span class="t-prompt">$</span> brew tap daksh-gargas/tap
+<span class="t-prompt">$</span> brew install claude2tmux</div>
+
+    <h3>Direct from GitHub</h3>
+    <p class="sub">One file, no dependencies beyond tmux and python3.</p>
+    <div class="cmd"><span class="t-prompt">$</span> curl -fsSL https://raw.githubusercontent.com/daksh-gargas/claude2tmux/main/claude2tmux \
+    -o /usr/local/bin/claude2tmux &amp;&amp; chmod +x /usr/local/bin/claude2tmux</div>
+    <p class="sub">
+      Or grab the
+      <a href="https://github.com/daksh-gargas/claude2tmux/releases">latest release tarball</a>
+      and <code>install -m 755 claude2tmux /usr/local/bin/</code>.
+    </p>
+
+    <h3>Optional: a <code>c2t</code> shortcut</h3>
+    <div class="cmd"><span class="t-prompt">$</span> claude2tmux --install-c2t &amp;&amp; exec zsh</div>
+    <p class="sub">
+      Writes a marked block to <code>~/.zshrc</code>, so re-running updates it in
+      place instead of appending a second copy. It backs the file up first, and
+      refuses to install if you already define <code>c2t</code> elsewhere.
+      <code>--uninstall-c2t</code> restores the file byte-for-byte.
+    </p>
+  </div>
+</section>
+
+<section id="use">
+  <div class="wrap">
+    <h2>Use</h2>
+    <div class="cmd"><span class="t-prompt">$</span> claude2tmux        <span class="t-mute"># list what would move — the default, changes nothing</span>
+<span class="t-prompt">$</span> claude2tmux --go   <span class="t-mute"># do it</span></div>
+
+    <p>
+      The listing states a disposition per session, so what actually moves is
+      never something you have to infer.
+    </p>
+
+    <table>
+      <thead>
+        <tr><th>Disposition</th><th>Meaning</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><span class="badge badge-move">MOVE</span></td>
+          <td>SIGTERMed, then relaunched as <code>claude --resume &lt;id&gt;</code> in a tmux window at the same cwd.</td>
+        </tr>
+        <tr>
+          <td><span class="badge badge-stage">STAGE</span></td>
+          <td>Window built, resume command typed but <strong>not</strong> entered. Never killed for you.</td>
+        </tr>
+        <tr>
+          <td><span class="badge badge-skip">SKIP</span></td>
+          <td>Already inside a tmux pane. Counted, not listed — there is nothing to do.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>
+      The session you run the command <em>from</em> is always
+      <span class="badge badge-stage">STAGE</span>, never
+      <span class="badge badge-move">MOVE</span> — killing it would abort the
+      migration mid-run. Quit that tab yourself, switch to its window, press
+      Enter.
+    </p>
+
+    <h3>Flags</h3>
+    <div class="cmd">-l, --list        list every session and its disposition; changes nothing
+    --plain       with --list: tab-separated for scripting
+    --go          perform the migration
+    --no-kill     with --go: build the windows, leave the originals running
+-s, --session N   target tmux session name (default: claude)
+    --install-c2t     add a `c2t` shell function to ~/.zshrc
+    --uninstall-c2t   remove it again
+-h, --help        usage</div>
+    <p class="sub">
+      Bare <code>claude2tmux</code> is identical to <code>--list</code>, and
+      <code>--list</code> overrides <code>--go</code> — asking to see the plan
+      never executes it. An unrecognised flag exits 2 rather than being ignored,
+      since a typo next to <code>--go</code> would otherwise be a bad surprise.
+    </p>
+  </div>
+</section>
+
+<section id="detection">
+  <div class="wrap">
+    <h2>How a session is detected</h2>
+    <p>
+      A candidate has to survive four filters. Three are structural facts; the
+      fourth is a heuristic, and it's worth knowing which is which.
+    </p>
+
+    <dl>
+      <dt>1. <code>argv[0]</code> basename is exactly <code>claude</code></dt>
+      <dd>
+        Not a substring match on the command line. A running Claude session
+        surrounds itself with shell wrappers whose command lines <em>contain</em>
+        "claude" — snapshot sourcing, <code>/tmp/claude-*-cwd</code> redirects —
+        and grepping would sweep all of them in. This uses shell parameter
+        expansion rather than <code>basename</code>, because login shells are
+        named <code>-zsh</code> and <code>basename</code> parses that as a flag.
+      </dd>
+
+      <dt>2. No <code>claude</code> ancestor</dt>
+      <dd>
+        A ppid walk, 25 levels. Subagents and teammates are always spawned under
+        a parent Claude, so this leaves only top-level sessions. It also
+        identifies "self": the nearest <code>claude</code> ancestor of
+        <code>$$</code>.
+      </dd>
+
+      <dt>3. Not on a tmux pane TTY</dt>
+      <dd>
+        This cannot be inferred from ancestry — a pane's shell is parented to the
+        tmux <em>server</em>, never to a Claude process — so it is checked
+        against <code>tmux list-panes -a -F '#{pane_tty}'</code> directly.
+        Without it, sessions already safely in tmux get killed and rebuilt for no
+        reason.
+      </dd>
+
+      <dt>4. A cwd and a session ID both resolve</dt>
+      <dd>
+        cwd via <code>lsof</code>, since macOS has no <code>/proc</code>. Session
+        ID from <code>--resume &lt;uuid&gt;</code> in argv when present —
+        definitive, because resuming appends to the same transcript rather than
+        forking a new one.
+      </dd>
+    </dl>
+
+    <p>
+      Filter 4's fallback is the soft spot. For a session started <em>without</em>
+      <code>--resume</code>, the ID is recovered by matching the recorded
+      <code>cwd</code> across transcripts and taking the most recently written.
+      If you ran two sessions in one directory and killed one, the survivor could
+      in principle be handed the dead one's ID. In practice the live session is
+      always the most recently written — but it is inference, not a fact read off
+      the process. <code>--list</code> shows you the resolved ID and the last
+      user message of every session, so you can check before committing.
+    </p>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <p>
+      MIT licensed ·
+      <a href="https://github.com/daksh-gargas/claude2tmux">github.com/daksh-gargas/claude2tmux</a>
+    </p>
+    <p>
+      Requires macOS, tmux, and python3. Not affiliated with Anthropic.
+    </p>
+  </div>
+</footer>
+
+</body>
+</html>
