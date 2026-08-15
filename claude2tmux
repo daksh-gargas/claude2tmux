@@ -1,0 +1,377 @@
+#!/usr/bin/env bash
+# claude2tmux — move Claude Code sessions running in plain terminals into tmux.
+#
+# WHY IT WORKS THIS WAY
+#   A live process's controlling terminal cannot be reassigned on macOS (no
+#   working `reptyr`). So this does not move processes — it *migrates sessions*.
+#   Claude Code appends every message to ~/.claude/projects/<slug>/<id>.jsonl as
+#   it happens, so killing a session and running `claude --resume <id>` in tmux
+#   restores the full conversation. Only an in-flight tool call is lost.
+#
+# USAGE
+#   claude2tmux -l, --list   # list every session and its disposition, change nothing
+#   claude2tmux --list --plain   # same, tab-separated for scripting:
+#                                #   DISPOSITION <TAB> tty <TAB> pid <TAB> sid <TAB> cwd
+#   claude2tmux              # same as --list (safe default)
+#   claude2tmux --go         # kill the originals, recreate them in tmux
+#   claude2tmux --go --no-kill   # build the tmux windows, leave originals alive
+#   claude2tmux -s work --go     # target tmux session name "work" (default: claude)
+#   claude2tmux --install-c2t    # add a `c2t` shell function to ~/.zshrc, then `exec zsh`
+#   claude2tmux --uninstall-c2t  # remove it again
+#
+# DISPOSITIONS
+#   MOVE   SIGTERMed, then relaunched as `claude --resume <id>` in a tmux window
+#   STAGE  window built, resume command typed but NOT entered — the session
+#          running this script, and everything under --no-kill. Never killed.
+#   SKIP   already inside a tmux pane; not listed, only counted
+#
+# The Claude session this script is invoked from (if any) is never killed. Its
+# tmux window is created with the resume command typed but NOT executed — quit
+# the original, switch to that window, press Enter.
+
+set -uo pipefail
+
+TSESSION="${CLAUDE2TMUX_SESSION:-claude}"
+CLAUDE_BIN="${CLAUDE_BIN:-$(command -v claude || echo claude)}"
+GO=0
+KILL_OLD=1
+LIST=0
+PLAIN=0
+INSTALL=0
+UNINSTALL=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -l|--list) LIST=1 ;;
+    --plain)   PLAIN=1 ;;
+    --go)      GO=1 ;;
+    --no-kill) KILL_OLD=0 ;;
+    --install-c2t)   INSTALL=1 ;;
+    --uninstall-c2t) UNINSTALL=1 ;;
+    -s|--session) TSESSION="${2:?--session needs a name}"; shift ;;
+    # Print the header comment block, stopping at the first non-comment line —
+    # a fixed line range silently leaks source code as the header grows.
+    -h|--help) awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"; exit 0 ;;
+    *) echo "claude2tmux: unknown option $1 (try --help)" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+# --list wins over --go: asking to see the plan should never execute it.
+[ "$LIST" -eq 1 ] && GO=0
+
+# ------------------------------------------------------ c2t shell func -----
+# Installed as a marked block so re-running updates in place instead of
+# appending a second copy, and --uninstall-c2t can remove it exactly.
+
+RCFILE="${CLAUDE2TMUX_RC:-${ZDOTDIR:-$HOME}/.zshrc}"
+MARK_A="# >>> claude2tmux (c2t) >>>"
+MARK_B="# <<< claude2tmux (c2t) <<<"
+
+rc_strip_block() {  # stdout = $RCFILE with any existing marked block removed
+  awk -v a="$MARK_A" -v b="$MARK_B" '
+    index($0,a)==1 {skip=1} !skip {print} index($0,b)==1 {skip=0}' "$RCFILE"
+}
+
+if [ "$INSTALL" -eq 1 ] || [ "$UNINSTALL" -eq 1 ]; then
+  [ -f "$RCFILE" ] || { echo "claude2tmux: no $RCFILE" >&2; exit 1; }
+  SELF_PATH=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
+  BAK="$RCFILE.bak-claude2tmux"
+  had_block=0; grep -qF "$MARK_A" "$RCFILE" && had_block=1
+
+  if [ "$UNINSTALL" -eq 1 ]; then
+    if [ "$had_block" -eq 0 ]; then echo "claude2tmux: no c2t block in $RCFILE"; exit 0; fi
+    cp "$RCFILE" "$BAK"
+    rc_strip_block >"$RCFILE.tmp$$" && mv "$RCFILE.tmp$$" "$RCFILE"
+    echo "claude2tmux: removed c2t from $RCFILE (backup: $BAK)"
+    echo "  Run: ${C_GRN:-}exec zsh${C_RST:-}   to drop it from the current shell."
+    exit 0
+  fi
+
+  # A c2t defined outside our block is someone else's — refuse to shadow it.
+  if [ "$had_block" -eq 0 ] && grep -qE '^[[:space:]]*(alias[[:space:]]+c2t=|c2t[[:space:]]*\(\))' "$RCFILE"; then
+    echo "claude2tmux: $RCFILE already defines c2t outside the managed block." >&2
+    echo "  Remove or rename it first — refusing to shadow it." >&2
+    exit 1
+  fi
+
+  cp "$RCFILE" "$BAK"
+  { rc_strip_block
+    printf '%s\n' "$MARK_A"
+    printf '%s\n' "c2t() {"
+    printf '%s\n' "  local bin=\"$SELF_PATH\""
+    printf '%s\n' "  [ -x \"\$bin\" ] || bin=\$(command -v claude2tmux) || {"
+    printf '%s\n' "    print -u2 'c2t: claude2tmux not found'; return 127"
+    printf '%s\n' "  }"
+    printf '%s\n' "  \"\$bin\" \"\$@\""
+    printf '%s\n' "}"
+    printf '%s\n' "$MARK_B"
+  } >"$RCFILE.tmp$$" && mv "$RCFILE.tmp$$" "$RCFILE"
+
+  if [ "$had_block" -eq 1 ]; then
+    echo "claude2tmux: updated the existing c2t block in $RCFILE (backup: $BAK)"
+  else
+    echo "claude2tmux: added c2t to $RCFILE (backup: $BAK)"
+  fi
+  echo "  Run: exec zsh    then: c2t --list"
+  echo "  Undo: claude2tmux --uninstall-c2t"
+  exit 0
+fi
+
+command -v tmux >/dev/null || { echo "claude2tmux: tmux not installed" >&2; exit 1; }
+
+TILDE='~'
+C_DIM=$'\033[2m'; C_CYAN=$'\033[36m'; C_YEL=$'\033[33m'; C_GRN=$'\033[32m'; C_RST=$'\033[0m'
+
+# ------------------------------------------------------------ helpers -----
+
+exe_of() {  # basename of argv[0] for a pid
+  local c; c=$(ps -o command= -p "$1" 2>/dev/null) || return 1
+  [ -n "$c" ] || return 1
+  local a0="${c%% *}"; printf '%s' "${a0##*/}"
+}
+
+ppid_of() { ps -o ppid= -p "$1" 2>/dev/null | tr -d ' '; }
+
+# Nearest `claude` ancestor of $1, or empty. Used both to skip subagent
+# processes (they always have a claude ancestor) and to find "self".
+claude_ancestor() {
+  local p depth=0
+  p=$(ppid_of "$1")
+  while [ -n "$p" ] && [ "$p" -gt 1 ] 2>/dev/null && [ "$depth" -lt 25 ]; do
+    if [ "$(exe_of "$p")" = "claude" ]; then echo "$p"; return 0; fi
+    p=$(ppid_of "$p"); depth=$((depth + 1))
+  done
+  return 1
+}
+
+cwd_of() {  # lsof is the only reliable way to read another process's cwd on macOS
+  lsof -a -p "$1" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1
+}
+
+# Resolve the session id for a live claude process:
+#   1. `--resume <uuid>` in argv is definitive (resume keeps the same id/file).
+#   2. Otherwise: newest non-agent .jsonl under ~/.claude/projects whose
+#      recorded cwd matches this process's cwd.
+sid_of() {
+  local pid="$1" cwd="$2" cmd sid
+  cmd=$(ps -o command= -p "$pid" 2>/dev/null)
+  sid=$(printf '%s' "$cmd" | sed -nE 's/.*--resume[ =]+([0-9a-fA-F-]{36}).*/\1/p')
+  if [ -n "$sid" ]; then printf '%s' "$sid"; return 0; fi
+  [ -n "$cwd" ] || return 1
+  python3 - "$cwd" <<'PY'
+import glob, json, os, sys
+want = sys.argv[1]
+root = os.path.expanduser("~/.claude/projects")
+files = [f for f in glob.glob(os.path.join(root, "*", "*.jsonl"))
+         if not os.path.basename(f).startswith("agent-")]
+files.sort(key=os.path.getmtime, reverse=True)
+for f in files:
+    try:
+        with open(f, errors="replace") as fh:
+            for i, line in enumerate(fh):
+                if i > 40: break
+                try: e = json.loads(line)
+                except Exception: continue
+                if e.get("type") == "user" and not e.get("isSidechain"):
+                    if e.get("cwd") == want and e.get("sessionId"):
+                        print(e["sessionId"]); sys.exit(0)
+                    break
+    except OSError:
+        continue
+PY
+}
+
+# Last user message of a session, for the dry-run listing.
+title_of() {
+  python3 - "$1" <<'PY'
+import glob, json, os, re, sys
+sid = sys.argv[1]
+root = os.path.expanduser("~/.claude/projects")
+hit = ""
+for f in glob.glob(os.path.join(root, "*", sid + ".jsonl")):
+    try:
+        with open(f, errors="replace") as fh:
+            for line in fh:
+                try: e = json.loads(line)
+                except Exception: continue
+                if e.get("type") != "user" or e.get("isSidechain"): continue
+                c = e.get("message", {}).get("content", "")
+                if isinstance(c, list):
+                    c = " ".join(p.get("text", "") for p in c
+                                 if isinstance(p, dict) and p.get("type") == "text")
+                c = re.sub(r"<[^>]*>", " ", str(c)).strip()
+                if c and not c.startswith("Caveat:"): hit = c
+    except OSError:
+        pass
+print(" ".join(hit.split())[:70])
+PY
+}
+
+# ----------------------------------------------------------- discover -----
+
+SELF_CLAUDE=$(claude_ancestor "$$" || true)
+
+# TTYs already owned by tmux panes. A pane's shell is parented to the tmux
+# SERVER, not to any claude, so the ancestor check below cannot see it — without
+# this set we would kill and rebuild sessions that are already safely in tmux.
+# tmux prints "/dev/ttys004"; ps prints "ttys004".
+TMUX_TTYS=$(tmux list-panes -a -F '#{pane_tty}' 2>/dev/null | sed 's|^/dev/||')
+
+# rows: pid \t tty \t sid \t cwd \t is_self
+ROWS=$(mktemp "${TMPDIR:-/tmp}/claude2tmux.XXXXXX")
+trap 'rm -f "$ROWS"' EXIT
+
+skipped_intmux=0
+while read -r pid tty cmd; do
+  a0="${cmd%% *}"; [ "${a0##*/}" = "claude" ] || continue
+  [ "$pid" = "$$" ] && continue
+  # Already inside tmux — nothing to migrate.
+  if [ -n "$TMUX_TTYS" ] && printf '%s\n' "$TMUX_TTYS" | grep -qx "$tty"; then
+    skipped_intmux=$((skipped_intmux + 1)); continue
+  fi
+  # Subagent / teammate processes always sit under another claude — skip them.
+  anc=$(claude_ancestor "$pid" || true)
+  [ -n "$anc" ] && continue
+  cwd=$(cwd_of "$pid"); [ -n "$cwd" ] || continue
+  sid=$(sid_of "$pid" "$cwd"); [ -n "$sid" ] || continue
+  self=0; [ "$pid" = "$SELF_CLAUDE" ] && self=1
+  printf '%s\t%s\t%s\t%s\t%s\n' "$pid" "$tty" "$sid" "$cwd" "$self" >>"$ROWS"
+done < <(ps -eo pid= -o tty= -o command=)
+
+if [ ! -s "$ROWS" ]; then
+  echo "claude2tmux: no Claude Code sessions running outside tmux."
+  [ "$skipped_intmux" -gt 0 ] && echo "  ($skipped_intmux already in a tmux pane — nothing to do.)"
+  exit 0
+fi
+
+# ------------------------------------------------------------- report -----
+# Disposition per row, so "what will actually move" is never inferred:
+#   MOVE   — SIGTERMed and relaunched automatically
+#   STAGE  — window built, resume command typed but NOT entered (self, or
+#            --no-kill: killing these is not ours to do, so you press Enter)
+
+n_move=0; n_stage=0
+
+# Preview the window name a cwd will get, applying the same dedupe the migrate
+# path uses — otherwise two sessions in one repo both preview as the same
+# window while the real run makes the second "<name>-2".
+# Sets $WNAME rather than echoing: a $(...) call would run in a subshell and
+# throw away the SEEN_NAMES update, silently disabling the dedupe.
+SEEN_NAMES=""
+WNAME=""
+preview_wname() {
+  local nm base n=2
+  nm=$(printf '%s' "${1##*/}" | tr -c '[:alnum:]_.-' '-' | cut -c1-18)
+  base="$nm"
+  while printf '%s\n' "$SEEN_NAMES" | grep -qx "$nm"; do
+    nm="${base}-${n}"; n=$((n + 1))
+  done
+  SEEN_NAMES="$SEEN_NAMES
+$nm"
+  WNAME="$nm"
+}
+
+# --plain: machine-readable, one row per line, no colour/wrapping.
+if [ "$PLAIN" -eq 1 ]; then
+  while IFS=$'\t' read -r pid tty sid cwd self; do
+    if [ "$self" = 1 ] || [ "$KILL_OLD" -eq 0 ]; then d=STAGE; n_stage=$((n_stage+1))
+    else d=MOVE; n_move=$((n_move+1)); fi
+    printf '%s\t%s\t%s\t%s\t%s\n' "$d" "$tty" "$pid" "$sid" "$cwd"
+  done <"$ROWS"
+  [ "$LIST" -eq 1 ] && exit 0
+else
+  echo
+  echo "  Sessions that will move into tmux session '${C_CYAN}${TSESSION}${C_RST}':"
+  echo
+  while IFS=$'\t' read -r pid tty sid cwd self; do
+    if [ "$self" = 1 ] || [ "$KILL_OLD" -eq 0 ]; then
+      tag="${C_YEL}STAGE${C_RST}"; n_stage=$((n_stage + 1))
+    else
+      tag="${C_GRN}MOVE ${C_RST}"; n_move=$((n_move + 1))
+    fi
+    preview_wname "$cwd"; wname="$WNAME"
+    printf '  %b  %s%-8s%s pid %-6s %s->%s %s%s:%s%s\n' \
+      "$tag" "$C_DIM" "$tty" "$C_RST" "$pid" "$C_DIM" "$C_RST" \
+      "$C_CYAN" "$TSESSION" "$wname" "$C_RST"
+    printf '         %s%s  %s%s\n' "$C_DIM" "${cwd/#$HOME/$TILDE}" "$(title_of "$sid")" "$C_RST"
+  done <"$ROWS"
+
+  echo
+  echo "  ${C_GRN}MOVE${C_RST}  ($n_move) SIGTERMed, then relaunched as ${C_DIM}claude --resume <id>${C_RST}."
+  if [ "$n_stage" -gt 0 ]; then
+    echo "  ${C_YEL}STAGE${C_RST} ($n_stage) window built, command typed but not entered — you quit the"
+    echo "        original and press Enter. Never killed for you."
+  fi
+  [ "$skipped_intmux" -gt 0 ] && \
+    echo "  ${C_DIM}SKIP  ($skipped_intmux) already in a tmux pane — not touched.${C_RST}"
+fi
+
+if [ "$LIST" -eq 1 ]; then
+  echo
+  echo "  Listing only. Run ${C_GRN}--go${C_RST} to perform it."
+  echo "  In-flight tool calls are lost; everything already in the transcript is restored."
+  echo
+  exit 0
+fi
+
+if [ "$GO" -eq 0 ]; then
+  echo
+  echo "  Dry run (same as ${C_DIM}--list${C_RST}). Re-run with ${C_GRN}--go${C_RST} to perform it."
+  echo "  In-flight tool calls are lost; everything already in the transcript is restored."
+  echo
+  exit 0
+fi
+
+# ------------------------------------------------------------ migrate -----
+
+BOOTSTRAP=""
+if ! tmux has-session -t "=$TSESSION" 2>/dev/null; then
+  tmux new-session -d -s "$TSESSION" -n _bootstrap -c "$HOME"
+  BOOTSTRAP=1
+fi
+
+made=0
+while IFS=$'\t' read -r pid tty sid cwd self; do
+  wbase="${cwd##*/}"
+  name=$(printf '%s' "$wbase" | tr -c '[:alnum:]_.-' '-' | cut -c1-18)
+  # dedupe window names
+  base="$name"; n=2
+  while tmux list-windows -t "=$TSESSION" -F '#W' 2>/dev/null | grep -qx "$name"; do
+    name="${base}-${n}"; n=$((n + 1))
+  done
+
+  if [ "$self" != 1 ] && [ "$KILL_OLD" -eq 1 ]; then
+    kill -TERM "$pid" 2>/dev/null
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.5
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+      echo "  ${C_YEL}warn${C_RST} pid $pid ($tty) did not exit on SIGTERM — skipping, kill it manually"
+      continue
+    fi
+  fi
+
+  tmux new-window -d -t "=$TSESSION:" -n "$name" -c "$cwd"
+  tmux send-keys -t "=$TSESSION:$name" "$CLAUDE_BIN --resume $sid"
+  if [ "$self" = 1 ] || [ "$KILL_OLD" -eq 0 ]; then
+    echo "  ${C_YEL}staged${C_RST} window '$name' — quit the original on $tty, then press Enter there"
+  else
+    tmux send-keys -t "=$TSESSION:$name" C-m
+    echo "  ${C_GRN}moved${C_RST}  $tty -> $TSESSION:$name  (${cwd/#$HOME/$TILDE})"
+  fi
+  made=$((made + 1))
+done <"$ROWS"
+
+[ -n "$BOOTSTRAP" ] && [ "$made" -gt 0 ] && tmux kill-window -t "=$TSESSION:_bootstrap" 2>/dev/null
+
+echo
+if [ -n "${TMUX:-}" ]; then
+  echo "  Done. Already inside tmux: tmux switch-client -t $TSESSION"
+elif [ -t 1 ]; then
+  echo "  Attaching to '$TSESSION'..."
+  exec tmux attach -t "=$TSESSION"
+else
+  echo "  Done. Attach with: tmux attach -t $TSESSION"
+fi
