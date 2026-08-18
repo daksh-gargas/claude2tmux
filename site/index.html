@@ -38,20 +38,19 @@
     </div>
 <pre><span class="t-prompt">$</span> claude2tmux
 
-  Sessions that will move into tmux session <span class="t-path">'claude'</span>:
+  iTerm2 window 1, 5 tab(s) -&gt; tmux session <span class="t-path">'claude'</span>: <span class="t-mute">(1 other iTerm2 window(s) not touched)</span>
 
-  <span class="t-move">MOVE </span>  <span class="t-mute">ttys000</span>  pid 39902  <span class="t-mute">-&gt;</span> <span class="t-path">claude:D4G4</span>
-         <span class="t-mute">~/GitHub/D4G4  People don't realise how crappy their sound is…</span>
-  <span class="t-stage">STAGE</span>  <span class="t-mute">ttys001</span>  pid 36339  <span class="t-mute">-&gt;</span> <span class="t-path">claude:dg</span>
-         <span class="t-mute">~  give me a flag which lists the sessions that will be moved</span>
-  <span class="t-move">MOVE </span>  <span class="t-mute">ttys002</span>  pid 30842  <span class="t-mute">-&gt;</span> <span class="t-path">claude:Wildr</span>
-         <span class="t-mute">~/GitHub/Wildr  Theme set to auto</span>
-  <span class="t-move">MOVE </span>  <span class="t-mute">ttys003</span>  pid 30259  <span class="t-mute">-&gt;</span> <span class="t-path">claude:First-Ink</span>
-         <span class="t-mute">~/GitHub/D4G4/First-Ink  lets make a new build</span>
-  <span class="t-move">MOVE </span>  <span class="t-mute">ttys005</span>  pid 57289  <span class="t-mute">-&gt;</span> <span class="t-path">claude:First-Ink-2</span>
-         <span class="t-mute">~/GitHub/D4G4/First-Ink  commit your work to main</span>
+  <span class="t-move">MOVE </span>  tab 1    <span class="t-mute">ttys000</span>  pid 39902  <span class="t-mute">-&gt;</span> <span class="t-path">claude:D4G4</span>
+           <span class="t-mute">~/GitHub/D4G4  People don't realise how crappy their sound is…</span>
+  <span class="t-stage">STAGE</span>  tab 2    <span class="t-mute">ttys001</span>  pid 36339  <span class="t-mute">-&gt;</span> <span class="t-path">claude:dg</span>
+           <span class="t-mute">~  this session</span>
+  <span class="t-mute">--     tab 3    ttys014  zsh    no Claude session</span>
+  <span class="t-move">MOVE </span>  tab 4    <span class="t-mute">ttys003</span>  pid 30259  <span class="t-mute">-&gt;</span> <span class="t-path">claude:First-Ink</span>
+           <span class="t-mute">~/GitHub/D4G4/First-Ink  lets make a new build</span>
+  <span class="t-mute">--     tab 5    ttys015  tmux   running tmux — its sessions are already in tmux</span>
 
-  <span class="t-move">MOVE </span> (4) SIGTERMed, then relaunched as claude --resume &lt;id&gt;.
+  <span class="t-move">MOVE </span> (2) SIGTERMed, then relaunched as claude --resume &lt;id&gt;.
+        The iTerm2 tab stays open — only the Claude process is stopped.
   <span class="t-stage">STAGE</span> (1) window built, command typed but not entered — you quit the
         original and press Enter. Never killed for you.
 
@@ -128,8 +127,9 @@
 <span class="t-prompt">$</span> claude2tmux --go   <span class="t-mute"># do it</span></div>
 
     <p>
-      The listing states a disposition per session, so what actually moves is
-      never something you have to infer.
+      It walks the tabs of the iTerm2 window you ran it from, in order, and says
+      what it found in each — so the listing reads like the window in front of
+      you, and you can see that every tab was looked at.
     </p>
 
     <table>
@@ -146,17 +146,40 @@
           <td>Window built, resume command typed but <strong>not</strong> entered. Never killed for you.</td>
         </tr>
         <tr>
+          <td><span class="badge badge-skip">--</span></td>
+          <td>A tab with no Claude session in it — a shell, tmux, an editor. Listed so you can see it was checked.</td>
+        </tr>
+        <tr>
           <td><span class="badge badge-skip">SKIP</span></td>
-          <td>Already inside a tmux pane, or has no controlling terminal. Counted, not listed — there is nothing to do.</td>
+          <td>A session that exists but is not safely movable. Every reason is named.</td>
         </tr>
       </tbody>
     </table>
 
     <p>
-      A session with no controlling TTY is not a terminal session at all — the
-      VS Code or JetBrains extension host, a <code>claude -p</code> run, a hook.
-      There is nothing to migrate, and SIGTERMing one would kill a session you
-      cannot see in any tab, so they are excluded before anything else happens.
+      Split panes are listed as <code>tab 2.1</code>, <code>tab 2.2</code>.
+      <strong>The iTerm2 tab is left open</strong> — only the Claude process
+      inside it is stopped, so the tab drops back to its shell prompt with its
+      scrollback intact.
+    </p>
+
+    <p>
+      Two whole classes of mistake are impossible by construction rather than by
+      filtering. A <strong>Claude desktop app</strong> or <strong>VS Code</strong>
+      session runs on a pty that is not an iTerm2 tab, so it can never be picked
+      up. And a tab running <strong>tmux</strong> holds its Claude sessions on
+      <em>pane</em> ttys rather than the tab's own tty, so sessions already in
+      tmux are never touched.
+    </p>
+
+    <p>
+      <span class="badge badge-skip">SKIP</span> is what's left: a session with no
+      transcript on disk to resume from, two processes sharing one id, or a stale
+      registry entry. A session whose ID cannot be <em>proven</em> is never
+      guessed at and never killed — it is
+      <span class="badge badge-stage">STAGE</span>d with a bare
+      <code>claude --resume</code>, which opens Claude Code's own interactive
+      picker.
     </p>
 
     <p>
@@ -172,6 +195,7 @@
     --plain       with --list: tab-separated for scripting
     --go          perform the migration
     --no-kill     with --go: build the windows, leave the originals running
+    --system      ignore iTerm2; scan every CLI session on the machine
 -s, --session N   target tmux session name (default: claude)
     --install-c2t     add a `c2t` shell function to ~/.zshrc
     --uninstall-c2t   remove it again
@@ -187,58 +211,116 @@
 
 <section id="detection">
   <div class="wrap">
-    <h2>How a session is detected</h2>
+    <h2>How a session is identified</h2>
     <p>
-      A candidate has to survive four filters. Three are structural facts; the
-      fourth is a heuristic, and it's worth knowing which is which.
+      The whole chain is four hops, and every hop is a fact rather than a guess:
     </p>
 
+    <div class="cmd">tab  -&gt;  tty  -&gt;  the claude on that tty  -&gt;  ~/.claude/sessions/&lt;pid&gt;.json  -&gt;  id</div>
+
+    <p>
+      iTerm2 is asked for its tabs over AppleScript, and hands back each tab's
+      <code>tty</code> directly. That tty is the honest link between a tab you can
+      see and a process you can signal: the session-level <code>claude</code> for a
+      tab is the one whose <em>controlling terminal is exactly that tty</em>,
+      excluding any process with a <code>claude</code> ancestor — those are
+      subagents and teammates.
+    </p>
+
+    <p>
+      Which window counts as "yours" is resolved by looking for the tab whose tty
+      matches this process's own; when you run it from inside tmux there is no such
+      tab, so it falls back to iTerm2's current (frontmost) window.
+    </p>
+
+    <p>
+      A trap worth naming: <code>ITERM_SESSION_ID</code> looks like it would answer
+      this and does not. It is inherited, so every process spawned under a tmux
+      server still carries the ID of whichever tab that server was first launched
+      from — years of tabs later. The tty is checked instead.
+    </p>
+
+    <p>
+      The last hop is the pid-keyed registry Claude Code maintains at
+      <code>~/.claude/sessions/&lt;pid&gt;.json</code>, in which each running
+      session records its own facts.
+    </p>
+
+    <div class="cmd">{ "pid": 74217, "sessionId": "c90402ec-…",
+  "cwd": "/Users/dg/GitHub/First-Ink",
+  "entrypoint": "cli", "kind": "interactive",
+  "tmux": "claude:@6.%6",
+  "procStart": "Mon Aug 17 21:00:23 2026" }</div>
+
+    <p>That turns what used to be inference into a lookup:</p>
+
     <dl>
-      <dt>1. <code>argv[0]</code> basename is exactly <code>claude</code></dt>
+      <dt>1. <code>sessionId</code></dt>
       <dd>
-        Not a substring match on the command line. A running Claude session
-        surrounds itself with shell wrappers whose command lines <em>contain</em>
-        "claude" — snapshot sourcing, <code>/tmp/claude-*-cwd</code> redirects —
-        and grepping would sweep all of them in. This uses shell parameter
-        expansion rather than <code>basename</code>, because login shells are
-        named <code>-zsh</code> and <code>basename</code> parses that as a flag.
+        The session's own ID, not a guess. Nothing is derived from the working
+        directory — see below for why that matters.
       </dd>
 
-      <dt>2. No <code>claude</code> ancestor</dt>
+      <dt>2. <code>entrypoint</code></dt>
       <dd>
-        A ppid walk, 25 levels. Subagents and teammates are always spawned under
-        a parent Claude, so this leaves only top-level sessions. It also
-        identifies "self": the nearest <code>claude</code> ancestor of
-        <code>$$</code>.
+        <code>cli</code>, <code>claude-desktop</code>, or
+        <code>claude-vscode</code>. Used by the <code>--system</code> fallback,
+        where there are no tabs to scope to; in iTerm2 mode the non-<code>cli</code>
+        sessions are already unreachable, since they own no tab.
       </dd>
 
-      <dt>3. Not on a tmux pane TTY</dt>
+      <dt>3. <code>tmux</code></dt>
       <dd>
-        This cannot be inferred from ancestry — a pane's shell is parented to the
-        tmux <em>server</em>, never to a Claude process — so it is checked
-        against <code>tmux list-panes -a -F '#{pane_tty}'</code> directly.
-        Without it, sessions already safely in tmux get killed and rebuilt for no
-        reason.
+        Set when the session already lives in a pane. Also a fallback concern,
+        cross-checked against <code>tmux list-panes -a -F '#{pane_tty}'</code>,
+        since a pane's shell is parented to the tmux <em>server</em> and no
+        ancestry walk can see it.
       </dd>
 
-      <dt>4. A cwd and a session ID both resolve</dt>
+      <dt>4. <code>procStart</code></dt>
       <dd>
-        cwd via <code>lsof</code>, since macOS has no <code>/proc</code>. Session
-        ID from <code>--resume &lt;uuid&gt;</code> in argv when present —
-        definitive, because resuming appends to the same transcript rather than
-        forking a new one.
+        Compared against the process's real start time (UTC versus
+        <code>ps -o lstart=</code> local, ±5s). This is what stops a leftover
+        record from a crashed session, or a recycled pid, from being resurrected.
       </dd>
     </dl>
 
     <p>
-      Filter 4's fallback is the soft spot. For a session started <em>without</em>
-      <code>--resume</code>, the ID is recovered by matching the recorded
-      <code>cwd</code> across transcripts and taking the most recently written.
-      If you ran two sessions in one directory and killed one, the survivor could
-      in principle be handed the dead one's ID. In practice the live session is
-      always the most recently written — but it is inference, not a fact read off
-      the process. <code>--list</code> shows you the resolved ID and the last
-      user message of every session, so you can check before committing.
+      Liveness is then confirmed with <code>ps -o comm=</code> — the executable
+      path, <em>not</em> <code>command</code>, because argv cannot be split on
+      whitespace: the desktop app ships <code>claude</code> under
+      <code>~/Library/Application&nbsp;Support/…</code>, so splitting argv on the
+      first space yields <code>/Users/you/Library/Application</code> and the
+      process stops looking like Claude at all.
+    </p>
+
+    <p>
+      Finally, <code>--resume &lt;id&gt;</code> is only offered for an ID whose
+      transcript actually exists on disk, and two live processes claiming the
+      same ID are reported rather than silently duplicated into two windows of
+      one conversation.
+    </p>
+
+    <h3>Why not match on the working directory</h3>
+    <p>
+      Earlier versions recovered the ID by matching a process's <code>cwd</code>
+      against the recorded <code>cwd</code> in
+      <code>~/.claude/projects/*/*.jsonl</code> and taking the most recently
+      written. A directory is not unique to a session, so that heuristic fails in
+      every direction at once. One repo can hold, simultaneously: several live
+      CLI sessions, a desktop-app session, an IDE session, and the transcripts of
+      sessions you exited hours ago — all writing into the same project folder.
+      Whichever one typed last wins the match, so the tool could open a
+      desktop-app conversation you never asked about, resurrect an exited one,
+      and leave the CLI session you actually wanted sitting in its bare terminal
+      — the last of those silently, since a session that lost the match simply
+      vanished from the output.
+    </p>
+
+    <p>
+      Every live <code>claude</code> process is now accounted for in the listing,
+      including the skips. A session can be skipped, but it can no longer
+      disappear.
     </p>
   </div>
 </section>

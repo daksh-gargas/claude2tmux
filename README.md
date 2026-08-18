@@ -54,24 +54,24 @@ claude2tmux            # list what would move — the default, changes nothing
 claude2tmux --go       # do it
 ```
 
-The listing states a disposition per session, so what actually moves is never
-something you have to infer:
+It walks the tabs of the iTerm2 window you ran it from, in order, and says what
+it found in each — so the listing reads like the window in front of you, and you
+can see that every tab was looked at:
 
 ```
-  Sessions that will move into tmux session 'claude':
+  iTerm2 window 1, 5 tab(s) -> tmux session 'claude': (1 other iTerm2 window(s) not touched)
 
-  MOVE   ttys000  pid 39902  -> claude:D4G4
-         ~/GitHub/D4G4  People don't realize how crappy their sound is...
-  STAGE  ttys001  pid 36339  -> claude:dg
-         ~  give me a flag which lists the sessions that will be moved
-  MOVE   ttys002  pid 30842  -> claude:Wildr
-         ~/GitHub/Wildr  Theme set to auto
-  MOVE   ttys003  pid 30259  -> claude:First-Ink
-         ~/GitHub/D4G4/First-Ink  lets make a new build
-  MOVE   ttys005  pid 57289  -> claude:First-Ink-2
-         ~/GitHub/D4G4/First-Ink  commit your work to main
+  MOVE   tab 1    ttys000  pid 39902  -> claude:D4G4
+           ~/GitHub/D4G4  People don't realize how crappy their sound is...
+  STAGE  tab 2    ttys001  pid 36339  -> claude:dg
+           ~  this session
+  --     tab 3    ttys014  zsh    no Claude session
+  MOVE   tab 4    ttys003  pid 30259  -> claude:First-Ink
+           ~/GitHub/D4G4/First-Ink  lets make a new build
+  --     tab 5    ttys015  tmux   running tmux — its sessions are already in tmux
 
-  MOVE  (4) SIGTERMed, then relaunched as claude --resume <id>.
+  MOVE  (2) SIGTERMed, then relaunched as claude --resume <id>.
+        The iTerm2 tab stays open — only the Claude process is stopped.
   STAGE (1) window built, command typed but not entered — you quit the
         original and press Enter. Never killed for you.
 ```
@@ -80,12 +80,23 @@ something you have to infer:
 |---|---|
 | `MOVE` | SIGTERMed, then relaunched as `claude --resume <id>` in a tmux window at the same cwd |
 | `STAGE` | Window built, resume command typed but **not** entered. Never killed for you |
-| `SKIP` | Already inside a tmux pane, or has no controlling terminal. Counted, not listed — nothing to do |
+| `--` | A tab with no Claude session in it — a shell, tmux, an editor. Listed so you can see it was checked |
+| `SKIP` | A session that exists but is not safely movable. Each reason is named |
 
-A session with no controlling TTY is not a terminal session at all: the VS Code
-or JetBrains extension host, a `claude -p` run, a hook. There is nothing to
-migrate, and SIGTERMing one would kill a session you cannot see in any tab — so
-they are excluded before anything else happens.
+Split panes are listed as `tab 2.1`, `tab 2.2`. **The iTerm2 tab is left open** —
+only the Claude process inside it is stopped, so the tab drops back to its shell
+prompt with its scrollback intact.
+
+Two whole classes of mistake are impossible by construction rather than by
+filtering. A **Claude desktop app** or **VS Code** session runs on a pty that is
+not an iTerm2 tab, so it can never be picked up. And a tab running **tmux** holds
+its Claude sessions on *pane* ttys rather than the tab's own tty, so sessions
+already in tmux are never touched.
+
+`SKIP` is what's left: a session with no transcript on disk to resume from, two
+processes sharing one id, or a stale registry entry. A session whose ID cannot be
+*proven* is never guessed at and never killed — it is `STAGE`d with a bare
+`claude --resume`, which opens Claude Code's own interactive picker.
 
 The session you run the command *from* is always `STAGE`, never `MOVE` — killing
 it would abort the migration mid-run. Quit that tab yourself, switch to its
@@ -99,6 +110,7 @@ window, press Enter.
                   DISPOSITION <TAB> tty <TAB> pid <TAB> sid <TAB> cwd
     --go          perform the migration
     --no-kill     with --go: build the windows, leave the originals running
+    --system      ignore iTerm2; scan every CLI session on the machine
 -s, --session N   target tmux session name (default: claude)
     --install-c2t     add a `c2t` shell function to ~/.zshrc
     --uninstall-c2t   remove it again
@@ -113,38 +125,78 @@ surprise.
 Env equivalents: `CLAUDE2TMUX_SESSION` (for `-s`), `CLAUDE_BIN` (path to the
 `claude` binary), `CLAUDE2TMUX_RC` (rc file for `--install-c2t`).
 
-## How a session is detected
+## How a session is identified
 
-A candidate has to survive four filters. Three are structural facts; the fourth
-is a heuristic, and it's worth knowing which is which.
+The whole chain is four hops, and every hop is a fact rather than a guess:
 
-1. **`argv[0]` basename is exactly `claude`.** Not a substring match on the
-   command line — a running Claude session surrounds itself with shell wrappers
-   whose command lines *contain* "claude" (snapshot sourcing, `/tmp/claude-*-cwd`
-   redirects), and grepping would sweep all of them in. This uses shell
-   parameter expansion rather than `basename`, because login shells are named
-   `-zsh` and `basename` parses that as a flag.
+```
+tab  ->  tty  ->  the claude on that tty  ->  ~/.claude/sessions/<pid>.json  ->  id
+```
 
-2. **No `claude` ancestor** (ppid walk, 25 levels). Subagents and teammates are
-   always spawned under a parent Claude, so this leaves only top-level sessions.
-   It also identifies "self": the nearest `claude` ancestor of `$$`.
+iTerm2 is asked for its tabs over AppleScript, and hands back each tab's `tty`
+directly. That tty is the honest link between a tab you can see and a process you
+can signal: the session-level `claude` for a tab is the one whose *controlling
+terminal is exactly that tty*, excluding any process with a `claude` ancestor
+(those are subagents and teammates).
 
-3. **Not on a tmux pane TTY.** This cannot be inferred from ancestry — a pane's
-   shell is parented to the tmux *server*, never to a Claude process — so it's
-   checked against `tmux list-panes -a -F '#{pane_tty}'` directly. Without it,
-   sessions already safely in tmux get killed and rebuilt for no reason.
+Which window counts as "yours" is resolved by looking for the tab whose tty
+matches this process's own; when you run it from inside tmux there is no such tab,
+so it falls back to iTerm2's current (frontmost) window.
 
-4. **A cwd and a session ID both resolve.** cwd via `lsof` (macOS has no
-   `/proc`). Session ID from `--resume <uuid>` in argv when present — definitive,
-   since resuming appends to the same transcript rather than forking a new one.
+A trap worth naming: `ITERM_SESSION_ID` looks like it would answer this and does
+not. It is inherited, so every process spawned under a tmux server still carries
+the ID of whichever tab that server was first launched from — years of tabs later.
+The tty is checked instead.
 
-Filter 4's fallback is the soft spot: for a session started *without* `--resume`,
-the ID is recovered by matching the recorded `cwd` across transcripts and taking
-the most recently written. If you ran two sessions in one directory and killed
-one, the survivor could in principle be handed the dead one's ID. In practice the
-live session is always the most recently written — but it is inference, not a
-fact read off the process. `--list` shows you the resolved ID and the last user
-message of each session, so you can check before committing.
+The last hop is the pid-keyed registry Claude Code maintains at
+`~/.claude/sessions/<pid>.json`, in which each running session records its own
+facts.
+
+```json
+{ "pid": 74217, "sessionId": "c90402ec-…", "cwd": "/Users/dg/GitHub/First-Ink",
+  "entrypoint": "cli", "kind": "interactive", "tmux": "claude:@6.%6",
+  "procStart": "Mon Aug 17 21:00:23 2026" }
+```
+
+That turns what used to be inference into a lookup:
+
+1. **`sessionId`** — the session's own ID, not a guess. Nothing is derived from
+   the working directory (see below).
+2. **`entrypoint`** — `cli`, `claude-desktop`, or `claude-vscode`. Used by the
+   `--system` fallback, where there are no tabs to scope to; in iTerm2 mode the
+   non-`cli` sessions are already unreachable, since they own no tab.
+3. **`tmux`** — set when the session already lives in a pane. Also a fallback
+   concern, cross-checked against `tmux list-panes -a -F '#{pane_tty}'`, since a
+   pane's shell is parented to the tmux *server* and no ancestry walk can see it.
+4. **`procStart`** — compared against the process's real start time (UTC vs
+   `ps -o lstart=` local, ±5s). This is what stops a leftover record from a
+   crashed session, or a recycled pid, from being resurrected.
+
+Liveness is then confirmed with `ps -o comm=` — the executable path, *not*
+`command`, because argv cannot be split on whitespace: the desktop app ships
+`claude` under `~/Library/Application Support/…`, so splitting argv on the first
+space yields `/Users/you/Library/Application` and the process stops looking like
+Claude at all.
+
+Finally, `--resume <id>` is only offered for an ID whose transcript actually
+exists on disk, and two live processes claiming the same ID are reported rather
+than silently duplicated into two windows of one conversation.
+
+### Why not match on the working directory
+
+Earlier versions recovered the ID by matching a process's `cwd` against the
+recorded `cwd` in `~/.claude/projects/*/*.jsonl` and taking the most recently
+written. A directory is not unique to a session, so that heuristic fails in
+every direction at once. One repo can hold, simultaneously: several live CLI
+sessions, a desktop-app session, an IDE session, and the transcripts of sessions
+you exited hours ago — all writing into the same project folder. Whichever one
+typed last wins the match, so the tool could open a desktop-app conversation you
+never asked about, resurrect an exited one, and leave the CLI session you
+actually wanted sitting in its bare terminal — the last of those silently, since
+a session that lost the match simply vanished from the output.
+
+Every live `claude` process is now accounted for in the listing, including the
+skips. A session can be skipped, but it can no longer disappear.
 
 ## License
 

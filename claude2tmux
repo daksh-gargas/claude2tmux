@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# claude2tmux — move Claude Code sessions running in plain terminals into tmux.
+# claude2tmux — move the Claude Code sessions in your iTerm2 tabs into tmux.
 #
 # WHY IT WORKS THIS WAY
 #   A live process's controlling terminal cannot be reassigned on macOS (no
@@ -8,13 +8,33 @@
 #   it happens, so killing a session and running `claude --resume <id>` in tmux
 #   restores the full conversation. Only an in-flight tool call is lost.
 #
+# WHAT IT LOOKS AT
+#   It asks iTerm2 for the tabs of the window you ran it from, and walks them.
+#   A tab's tty is the honest link between a tab you can see and a process:
+#
+#     tab -> tty -> the claude on that tty -> ~/.claude/sessions/<pid>.json -> id
+#
+#   Scoping to real iTerm2 tabs is what keeps the wrong sessions out. A Claude
+#   desktop-app or VS Code session runs on a pty that is not an iTerm2 tab, so it
+#   can never appear. A tab running tmux holds its claude on a *pane* tty, not the
+#   tab's own tty, so sessions already in tmux are excluded by construction.
+#
+#   Session ids are read from ~/.claude/sessions/<pid>.json, where each running
+#   session records its own sessionId, cwd, entrypoint and procStart. Nothing is
+#   inferred from the working directory: one directory can hold many concurrent
+#   sessions, so directory-matching picks the wrong conversation — see README.
+#
+#   With no iTerm2 to ask (Terminal.app, Ghostty, ssh, cron), it falls back to
+#   scanning that registry for CLI sessions system-wide. `--system` forces it.
+#
 # USAGE
-#   claude2tmux -l, --list   # list every session and its disposition, change nothing
+#   claude2tmux -l, --list   # list the tabs and what will happen, change nothing
 #   claude2tmux --list --plain   # same, tab-separated for scripting:
-#                                #   DISPOSITION <TAB> tty <TAB> pid <TAB> sid <TAB> cwd
+#                                #   DISPOSITION <TAB> where <TAB> tty <TAB> pid <TAB> sid <TAB> cwd
 #   claude2tmux              # same as --list (safe default)
 #   claude2tmux --go         # kill the originals, recreate them in tmux
 #   claude2tmux --go --no-kill   # build the tmux windows, leave originals alive
+#   claude2tmux --system     # ignore iTerm2; scan every CLI session on the machine
 #   claude2tmux -s work --go     # target tmux session name "work" (default: claude)
 #   claude2tmux --install-c2t    # add a `c2t` shell function to ~/.zshrc, then `exec zsh`
 #   claude2tmux --uninstall-c2t  # remove it again
@@ -22,13 +42,17 @@
 # DISPOSITIONS
 #   MOVE   SIGTERMed, then relaunched as `claude --resume <id>` in a tmux window
 #   STAGE  window built, resume command typed but NOT entered — the session
-#          running this script, and everything under --no-kill. Never killed.
-#   SKIP   already inside a tmux pane, or has no controlling terminal (editor
-#          extension / headless run); not listed, only counted
+#          running this script, everything under --no-kill, and any session
+#          whose id could not be proven. Never killed.
+#   --     a tab with no Claude session in it (a shell, tmux, an editor). Shown
+#          so you can see every tab was looked at.
+#   SKIP   a session that exists but is not safely movable: no transcript on disk
+#          to resume from, two processes sharing one id, a stale registry entry.
 #
-# The Claude session this script is invoked from (if any) is never killed. Its
-# tmux window is created with the resume command typed but NOT executed — quit
-# the original, switch to that window, press Enter.
+# The iTerm2 tab is left open and untouched — only the Claude process inside it
+# is stopped. The Claude session this script runs from is never killed: its tmux
+# window is created with the resume command typed but NOT executed, so you quit
+# the original, switch to that window, and press Enter.
 
 set -uo pipefail
 
@@ -40,6 +64,7 @@ LIST=0
 PLAIN=0
 INSTALL=0
 UNINSTALL=0
+FORCE_SYSTEM=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -47,6 +72,7 @@ while [ $# -gt 0 ]; do
     --plain)   PLAIN=1 ;;
     --go)      GO=1 ;;
     --no-kill) KILL_OLD=0 ;;
+    --system)  FORCE_SYSTEM=1 ;;
     --install-c2t)   INSTALL=1 ;;
     --uninstall-c2t) UNINSTALL=1 ;;
     -s|--session) TSESSION="${2:?--session needs a name}"; shift ;;
@@ -85,7 +111,7 @@ if [ "$INSTALL" -eq 1 ] || [ "$UNINSTALL" -eq 1 ]; then
     cp "$RCFILE" "$BAK"
     rc_strip_block >"$RCFILE.tmp$$" && mv "$RCFILE.tmp$$" "$RCFILE"
     echo "claude2tmux: removed c2t from $RCFILE (backup: $BAK)"
-    echo "  Run: ${C_GRN:-}exec zsh${C_RST:-}   to drop it from the current shell."
+    echo "  Run: exec zsh   to drop it from the current shell."
     exit 0
   fi
 
@@ -120,22 +146,28 @@ if [ "$INSTALL" -eq 1 ] || [ "$UNINSTALL" -eq 1 ]; then
 fi
 
 command -v tmux >/dev/null || { echo "claude2tmux: tmux not installed" >&2; exit 1; }
+command -v python3 >/dev/null || { echo "claude2tmux: python3 not found" >&2; exit 1; }
 
 TILDE='~'
-C_DIM=$'\033[2m'; C_CYAN=$'\033[36m'; C_YEL=$'\033[33m'; C_GRN=$'\033[32m'; C_RST=$'\033[0m'
+C_DIM=$'\033[2m'; C_CYAN=$'\033[36m'; C_YEL=$'\033[33m'; C_GRN=$'\033[32m'
+C_RED=$'\033[31m'; C_RST=$'\033[0m'
+
+CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 
 # ------------------------------------------------------------ helpers -----
 
-exe_of() {  # basename of argv[0] for a pid
-  local c; c=$(ps -o command= -p "$1" 2>/dev/null) || return 1
+exe_of() {  # basename of the executable for a pid
+  # `comm`, not `command`: argv cannot be split on whitespace, because the
+  # desktop app's claude lives under ~/Library/Application Support/...
+  local c; c=$(ps -o comm= -p "$1" 2>/dev/null) || return 1
   [ -n "$c" ] || return 1
-  local a0="${c%% *}"; printf '%s' "${a0##*/}"
+  printf '%s' "${c##*/}"
 }
 
 ppid_of() { ps -o ppid= -p "$1" 2>/dev/null | tr -d ' '; }
 
-# Nearest `claude` ancestor of $1, or empty. Used both to skip subagent
-# processes (they always have a claude ancestor) and to find "self".
+# Nearest `claude` ancestor of $1, or empty — used to find "self", the session
+# this script was invoked from, which must never be killed.
 claude_ancestor() {
   local p depth=0
   p=$(ppid_of "$1")
@@ -146,49 +178,11 @@ claude_ancestor() {
   return 1
 }
 
-cwd_of() {  # lsof is the only reliable way to read another process's cwd on macOS
-  lsof -a -p "$1" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1
-}
-
-# Resolve the session id for a live claude process:
-#   1. `--resume <uuid>` in argv is definitive (resume keeps the same id/file).
-#   2. Otherwise: newest non-agent .jsonl under ~/.claude/projects whose
-#      recorded cwd matches this process's cwd.
-sid_of() {
-  local pid="$1" cwd="$2" cmd sid
-  cmd=$(ps -o command= -p "$pid" 2>/dev/null)
-  sid=$(printf '%s' "$cmd" | sed -nE 's/.*--resume[ =]+([0-9a-fA-F-]{36}).*/\1/p')
-  if [ -n "$sid" ]; then printf '%s' "$sid"; return 0; fi
-  [ -n "$cwd" ] || return 1
-  python3 - "$cwd" <<'PY'
-import glob, json, os, sys
-want = sys.argv[1]
-root = os.path.expanduser("~/.claude/projects")
-files = [f for f in glob.glob(os.path.join(root, "*", "*.jsonl"))
-         if not os.path.basename(f).startswith("agent-")]
-files.sort(key=os.path.getmtime, reverse=True)
-for f in files:
-    try:
-        with open(f, errors="replace") as fh:
-            for i, line in enumerate(fh):
-                if i > 40: break
-                try: e = json.loads(line)
-                except Exception: continue
-                if e.get("type") == "user" and not e.get("isSidechain"):
-                    if e.get("cwd") == want and e.get("sessionId"):
-                        print(e["sessionId"]); sys.exit(0)
-                    break
-    except OSError:
-        continue
-PY
-}
-
-# Last user message of a session, for the dry-run listing.
+# Last user message of a session, for the listing.
 title_of() {
-  python3 - "$1" <<'PY'
+  python3 - "$CLAUDE_DIR" "$1" <<'PY'
 import glob, json, os, re, sys
-sid = sys.argv[1]
-root = os.path.expanduser("~/.claude/projects")
+root, sid = os.path.join(sys.argv[1], "projects"), sys.argv[2]
 hit = ""
 for f in glob.glob(os.path.join(root, "*", sid + ".jsonl")):
     try:
@@ -205,63 +199,345 @@ for f in glob.glob(os.path.join(root, "*", sid + ".jsonl")):
                 if c and not c.startswith("Caveat:"): hit = c
     except OSError:
         pass
-print(" ".join(hit.split())[:70])
+print(" ".join(hit.split())[:60])
 PY
 }
+
+# ------------------------------------------------------- iTerm2 tabs -----
+# `application "iTerm2" is running` is checked first because a bare `tell` would
+# LAUNCH iTerm2 on a machine that isn't running it. Output lines:
+#   R|1                       iTerm2 is running (emitted before anything can fail)
+#   W|<window-index>|<is-current>
+#   S|<window-index>|<tab-index>|<pane-index>|<tty>|<tab-name>
+#
+# Every property read is wrapped in its own `try`. A window whose session has
+# ended has no readable id or tty, and one such window used to abort the whole
+# enumeration — which silently downgraded the run to a machine-wide scan, i.e.
+# quietly touching sessions outside the window you asked about. Losing one tab
+# from the listing is acceptable; changing what the tool operates on is not.
+
+iterm_tabs() {
+  osascript <<'AS' 2>/dev/null
+on run
+  set LF to ASCII character 10
+  set out to ""
+  if application "iTerm2" is running then
+    set out to "R|1" & LF
+    tell application "iTerm2"
+      set curId to ""
+      try
+        set curId to (id of current window) as text
+      end try
+      set wi to 0
+      repeat with w in windows
+        set wi to wi + 1
+        set isCur to "0"
+        try
+          if ((id of w) as text) = curId then set isCur to "1"
+        end try
+        set out to out & "W|" & wi & "|" & isCur & LF
+        set ti to 0
+        try
+          repeat with t in tabs of w
+            set ti to ti + 1
+            set si to 0
+            try
+              repeat with s in sessions of t
+                set si to si + 1
+                try
+                  set out to out & "S|" & wi & "|" & ti & "|" & si & "|" & (tty of s) & "|" & (name of s) & LF
+                end try
+              end repeat
+            end try
+          end repeat
+        end try
+      end repeat
+    end tell
+  end if
+  return out
+end run
+AS
+}
+
+ITERM=""
+if [ "$FORCE_SYSTEM" -eq 0 ]; then
+  ITERM=$(iterm_tabs || true)
+fi
+# iTerm2 running is what selects tab mode — not whether tabs were readable. If
+# iTerm2 is up but reports nothing usable, the run stops rather than falling back
+# to a machine-wide scan, which would widen scope without being asked.
+MODE=system
+case "$ITERM" in "R|1"*) MODE=iterm ;; esac
 
 # ----------------------------------------------------------- discover -----
 
 SELF_CLAUDE=$(claude_ancestor "$$" || true)
+SELF_TTY=$(ps -o tty= -p $$ 2>/dev/null | tr -d ' ')
 
-# TTYs already owned by tmux panes. A pane's shell is parented to the tmux
-# SERVER, not to any claude, so the ancestor check below cannot see it — without
-# this set we would kill and rebuild sessions that are already safely in tmux.
-# tmux prints "/dev/ttys004"; ps prints "ttys004".
-TMUX_TTYS=$(tmux list-panes -a -F '#{pane_tty}' 2>/dev/null | sed 's|^/dev/||')
+# Only needed by the system-mode fallback: a pane's shell is parented to the
+# tmux SERVER, not to any claude, so an ancestor walk cannot see it.
+TMUX_TTYS=$(tmux list-panes -a -F '#{pane_tty}' 2>/dev/null | sed 's|^/dev/||' | tr '\n' ' ')
 
-# rows: pid \t tty \t sid \t cwd \t is_self
 ROWS=$(mktemp "${TMPDIR:-/tmp}/claude2tmux.XXXXXX")
-trap 'rm -f "$ROWS"' EXIT
+PLAN=$(mktemp "${TMPDIR:-/tmp}/claude2tmux.plan.XXXXXX")
+trap 'rm -f "$ROWS" "$PLAN"' EXIT
 
-skipped_intmux=0
-skipped_notty=0
-while read -r pid tty cmd; do
-  a0="${cmd%% *}"; [ "${a0##*/}" = "claude" ] || continue
-  [ "$pid" = "$$" ] && continue
-  # No controlling terminal (ps prints "??") means this is not a terminal
-  # session at all — the VS Code / JetBrains extension host, a `claude -p` run,
-  # a hook. There is nothing to migrate, and SIGTERMing one would kill a
-  # session the user cannot see in any tab.
-  case "$tty" in
-    ''|'?'|'??') skipped_notty=$((skipped_notty + 1)); continue ;;
-  esac
-  # Already inside tmux — nothing to migrate.
-  if [ -n "$TMUX_TTYS" ] && printf '%s\n' "$TMUX_TTYS" | grep -qx "$tty"; then
-    skipped_intmux=$((skipped_intmux + 1)); continue
-  fi
-  # Subagent / teammate processes always sit under another claude — skip them.
-  anc=$(claude_ancestor "$pid" || true)
-  [ -n "$anc" ] && continue
-  cwd=$(cwd_of "$pid"); [ -n "$cwd" ] || continue
-  sid=$(sid_of "$pid" "$cwd"); [ -n "$sid" ] || continue
-  self=0; [ "$pid" = "$SELF_CLAUDE" ] && self=1
-  printf '%s\t%s\t%s\t%s\t%s\n' "$pid" "$tty" "$sid" "$cwd" "$self" >>"$ROWS"
-done < <(ps -eo pid= -o tty= -o command=)
+# Rows are 8 tab-separated fields, and empty values are written as "-" because
+# tab is IFS whitespace: `read` collapses two adjacent tabs into one delimiter,
+# so a genuinely empty field silently shifts every later column.
+#   disp \t where \t pid \t tty \t sid \t cwd \t extra \t note
+C2T_CLAUDE_DIR="$CLAUDE_DIR" \
+C2T_SELF_PID="${SELF_CLAUDE:-}" \
+C2T_SELF_TTY="$SELF_TTY" \
+C2T_TMUX_TTYS="$TMUX_TTYS" \
+C2T_MODE="$MODE" \
+C2T_ITERM="$ITERM" \
+C2T_KILL_OLD="$KILL_OLD" \
+python3 - >"$ROWS" <<'PY'
+import calendar, glob, json, os, re, subprocess, sys, time
 
-if [ ! -s "$ROWS" ]; then
-  echo "claude2tmux: no Claude Code sessions running outside tmux."
-  [ "$skipped_intmux" -gt 0 ] && echo "  ($skipped_intmux already in a tmux pane — nothing to do.)"
-  [ "$skipped_notty" -gt 0 ] && echo "  ($skipped_notty with no controlling terminal — editor extension or headless run.)"
-  exit 0
-fi
+CDIR      = os.environ["C2T_CLAUDE_DIR"]
+SELF_PID  = os.environ.get("C2T_SELF_PID", "").strip()
+SELF_TTY  = os.environ.get("C2T_SELF_TTY", "").strip()
+TMUX_TTYS = set(t for t in os.environ.get("C2T_TMUX_TTYS", "").split() if t)
+MODE      = os.environ.get("C2T_MODE", "system")
+KILL_OLD  = os.environ.get("C2T_KILL_OLD", "1") == "1"
+
+UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
+                  r"-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+
+
+def ps_procs():
+    """pid -> {tty, exe, ppid, start}. lstart is exactly 5 tokens, and `comm`
+    (the executable path, no argv) is used instead of `command` because argv
+    cannot be split on whitespace: the desktop app ships claude under
+    ~/Library/Application Support/..., so argv[0] itself contains spaces."""
+    out = subprocess.run(["ps", "-eo", "pid=,ppid=,tty=,lstart=,comm="],
+                         capture_output=True, text=True, errors="replace").stdout
+    procs = {}
+    for line in out.splitlines():
+        f = line.split(None, 8)
+        if len(f) < 9:
+            continue
+        pid, ppid, tty = f[0], f[1], f[2]
+        lstart, exe = " ".join(f[3:8]), f[8].strip()
+        try:
+            # ps prints local time; Claude's procStart is UTC (compared below).
+            start = time.mktime(time.strptime(lstart, "%a %b %d %H:%M:%S %Y"))
+        except ValueError:
+            start = None
+        procs[pid] = {"tty": tty, "exe": exe, "ppid": ppid, "start": start}
+    return procs
+
+
+def is_claude(exe):
+    # Case-sensitive: the Electron shell is .../MacOS/Claude, not a session.
+    return os.path.basename(exe) == "claude"
+
+
+def cwd_of(pid):  # lsof is the only reliable way to read another process's cwd
+    out = subprocess.run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
+                         capture_output=True, text=True, errors="replace").stdout
+    for line in out.splitlines():
+        if line.startswith("n"):
+            return line[1:]
+    return ""
+
+
+def transcript_exists(sid):
+    return bool(glob.glob(os.path.join(CDIR, "projects", "*", sid + ".jsonl")))
+
+
+procs = ps_procs()
+claude_pids = {p for p, d in procs.items() if is_claude(d["exe"])}
+
+
+def has_claude_ancestor(pid):
+    """Subagents and teammates are spawned under a parent claude; only the
+    outermost process on a tty is the session the user sees."""
+    seen, p, depth = set(), procs.get(pid, {}).get("ppid"), 0
+    while p and p != "1" and p not in seen and depth < 25:
+        seen.add(p)
+        if p in claude_pids:
+            return True
+        p = procs.get(p, {}).get("ppid")
+        depth += 1
+    return False
+
+
+# ------------------------------------------------------------- registry ----
+# pid -> record, but only for records proven to describe the live process.
+
+recs, stale = {}, []
+for f in sorted(glob.glob(os.path.join(CDIR, "sessions", "*.json"))):
+    base = os.path.basename(f)
+    if not base[:-5].isdigit():          # ignore the *.key files and friends
+        continue
+    try:
+        with open(f, errors="replace") as fh:
+            rec = json.load(fh)
+    except Exception:
+        continue
+    pid = str(rec.get("pid") or base[:-5])
+    proc = procs.get(pid)
+    # A registry file outlives a hard-killed process, and pids get recycled.
+    # Requiring a live *claude* whose start time matches procStart is what stops
+    # an exited session from being resurrected under someone else's pid.
+    if proc is None or not is_claude(proc["exe"]):
+        stale.append((pid, "-", rec.get("sessionId") or "-",
+                      "no live claude at this pid"))
+        continue
+    if rec.get("procStart") and proc["start"] is not None:
+        try:
+            want = calendar.timegm(time.strptime(
+                " ".join(str(rec["procStart"]).split()), "%a %b %d %H:%M:%S %Y"))
+        except ValueError:
+            want = None
+        if want is not None and abs(want - proc["start"]) > 5:
+            stale.append((pid, proc["tty"], rec.get("sessionId") or "-",
+                          "pid reused by a different process"))
+            continue
+    recs[pid] = rec
+
+
+def emit(disp, where, pid, tty, sid, cwd, extra, note=""):
+    print("\t".join([disp, where or "-", str(pid) or "-", tty or "-", sid or "-",
+                     cwd or "-", extra or "-", note or "-"]))
+
+
+by_sid = {}
+
+
+def classify(where, pid, tty):
+    """One tab / one process -> one row, with its final disposition. The
+    MOVE/STAGE decision lives here alone so the listing and the migration can
+    never disagree about what will happen."""
+    rec = recs.get(pid)
+    if rec is None:
+        # Live claude, no record we can trust. Its id is unknown, so it is
+        # staged with an interactive picker and never killed — guessing the id
+        # is exactly what broke this before.
+        emit("STAGE", where, pid, tty, "", cwd_of(pid), "claude", "unknown-id")
+        return
+    sid = str(rec.get("sessionId") or "")
+    cwd = rec.get("cwd") or cwd_of(pid)
+    entry = rec.get("entrypoint") or "?"
+    if not UUID.fullmatch(sid):
+        emit("SKIP:nosid", where, pid, tty, "", cwd, entry, "no session id on record")
+        return
+    if not transcript_exists(sid):
+        emit("SKIP:notranscript", where, pid, tty, sid, cwd, entry,
+             "no transcript on disk — --resume would fail")
+        return
+    if sid in by_sid:
+        emit("SKIP:dup", where, pid, tty, sid, cwd, entry,
+             "same session id as pid " + by_sid[sid])
+        return
+    by_sid[sid] = pid
+    # Never kill the session running this script: doing so aborts the migration
+    # mid-run. Under --no-kill, killing is not ours to do at all.
+    self = pid == SELF_PID
+    emit("STAGE" if (self or not KILL_OLD) else "MOVE",
+         where, pid, tty, sid, cwd, entry, "self" if self else "-")
+
+
+def claude_on(tty):
+    """The session-level claude whose controlling terminal is exactly `tty`."""
+    hits = [p for p in claude_pids
+            if procs[p]["tty"] == tty and not has_claude_ancestor(p)]
+    return sorted(hits, key=int)[0] if hits else None
+
+
+def foreground_of(tty):
+    """What a tab is showing, for tabs with no Claude session in them. The
+    newest process on the tty is a good enough stand-in for the foreground job
+    without parsing process groups."""
+    on = [p for p in procs if procs[p]["tty"] == tty]
+    if not on:
+        return "no process"
+    newest = sorted(on, key=int)[-1]
+    return os.path.basename(procs[newest]["exe"]).lstrip("-") or "?"
+
+
+if MODE == "iterm":
+    # ---- parse the AppleScript table
+    wins, sess = {}, []
+    for line in os.environ.get("C2T_ITERM", "").splitlines():
+        f = line.split("|")
+        if f[0] == "W" and len(f) >= 3:
+            wins[f[1]] = f[2] == "1"
+        elif f[0] == "S" and len(f) >= 6:
+            # name may contain "|"; it is display-only, so rejoin the tail
+            sess.append((f[1], f[2], f[3], f[4].replace("/dev/", ""),
+                         "|".join(f[5:])))
+
+    # The window we were invoked from, identified by our own tty. Inside tmux
+    # our tty is a pane, which belongs to no iTerm2 tab — then fall back to
+    # iTerm2's own idea of the current (frontmost) window, and failing that to
+    # window 1, since iTerm2 lists windows front-to-back.
+    target = None
+    if SELF_TTY and SELF_TTY not in ("", "?", "??"):
+        for wi, ti, si, tty, name in sess:
+            if tty == SELF_TTY:
+                target = wi
+                break
+    if target is None:
+        target = next((wi for wi, cur in wins.items() if cur), None)
+    if target is None and wins:
+        target = sorted(wins, key=int)[0]
+
+    mine = [s for s in sess if s[0] == target]
+    panes_per_tab = {}
+    for wi, ti, si, tty, name in mine:
+        panes_per_tab[ti] = panes_per_tab.get(ti, 0) + 1
+
+    print("#\tmode=iterm\twindow=%s\ttabs=%d\twindows=%d"
+          % (target or "-", len(panes_per_tab), len(wins)))
+
+    for wi, ti, si, tty, name in sorted(mine, key=lambda s: (int(s[1]), int(s[2]))):
+        where = "tab %s" % ti if panes_per_tab[ti] == 1 else "tab %s.%s" % (ti, si)
+        pid = claude_on(tty)
+        if pid is None:
+            fg = foreground_of(tty)
+            note = ("running tmux — its sessions are already in tmux"
+                    if fg.startswith("tmux") else "no Claude session")
+            emit("NONE", where, "-", tty, "", "", fg, note)
+        else:
+            classify(where, pid, tty)
+else:
+    print("#\tmode=system\twindow=-\ttabs=0\twindows=0")
+    for pid in sorted(claude_pids, key=int):
+        d = procs[pid]
+        if d["tty"] in ("", "?", "??"):
+            continue                     # headless: not a terminal session
+        if d["tty"] in TMUX_TTYS:
+            emit("SKIP:tmux", "-", pid, d["tty"], "", "", "-", "already in a tmux pane")
+            continue
+        if has_claude_ancestor(pid):
+            continue                     # subagent of another claude
+        rec = recs.get(pid)
+        if rec is not None and (rec.get("entrypoint") or "cli") != "cli":
+            emit("SKIP:" + rec["entrypoint"], "-", pid, d["tty"],
+                 rec.get("sessionId") or "", rec.get("cwd") or "",
+                 rec["entrypoint"], "not a terminal session")
+            continue
+        if rec is not None and rec.get("tmux"):
+            emit("SKIP:tmux", "-", pid, d["tty"], rec.get("sessionId") or "",
+                 rec.get("cwd") or "", "-", "already in a tmux pane")
+            continue
+        classify("-", pid, d["tty"])
+
+for pid, tty, sid, why in stale:
+    emit("SKIP:stale", "-", pid, tty, sid, "", "-", why)
+PY
+
+read -r _ MODEF WINF TABSF WINSF < <(head -1 "$ROWS" | tr '\t' ' ')
+MODE="${MODEF#mode=}"; WIN="${WINF#window=}"; NTABS="${TABSF#tabs=}"; NWINS="${WINSF#windows=}"
 
 # ------------------------------------------------------------- report -----
-# Disposition per row, so "what will actually move" is never inferred:
-#   MOVE   — SIGTERMed and relaunched automatically
-#   STAGE  — window built, resume command typed but NOT entered (self, or
-#            --no-kill: killing these is not ours to do, so you press Enter)
+# Disposition per row, so "what will actually move" is never inferred.
 
-n_move=0; n_stage=0
+n_move=0; n_stage=0; n_none=0
 
 # Preview the window name a cwd will get, applying the same dedupe the migrate
 # path uses — otherwise two sessions in one repo both preview as the same
@@ -282,54 +558,106 @@ $nm"
   WNAME="$nm"
 }
 
-# --plain: machine-readable, one row per line, no colour/wrapping.
+# The migration plan is just the actionable rows, in the order they were
+# discovered — tab order in iTerm2 mode. Dispositions were decided once, during
+# discovery, so nothing here can disagree with what the listing showed.
+awk -F'\t' 'NR>1 && ($1=="MOVE" || $1=="STAGE") {
+  printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", $1, $2, $3, $4, $5, $6, $8}' "$ROWS" >"$PLAN"
+n_move=$(awk -F'\t' 'NR>1 && $1=="MOVE"' "$ROWS" | wc -l | tr -d ' ')
+n_stage=$(awk -F'\t' 'NR>1 && $1=="STAGE"' "$ROWS" | wc -l | tr -d ' ')
+
 if [ "$PLAIN" -eq 1 ]; then
-  while IFS=$'\t' read -r pid tty sid cwd self; do
-    if [ "$self" = 1 ] || [ "$KILL_OLD" -eq 0 ]; then d=STAGE; n_stage=$((n_stage+1))
-    else d=MOVE; n_move=$((n_move+1)); fi
-    printf '%s\t%s\t%s\t%s\t%s\n' "$d" "$tty" "$pid" "$sid" "$cwd"
-  done <"$ROWS"
+  awk -F'\t' 'NR>1 {printf "%s\t%s\t%s\t%s\t%s\t%s\n", $1, $2, $4, $3, $5, $6}' "$ROWS"
   [ "$LIST" -eq 1 ] && exit 0
 else
   echo
-  echo "  Sessions that will move into tmux session '${C_CYAN}${TSESSION}${C_RST}':"
+  if [ "$MODE" = iterm ] && [ "${NTABS:-0}" -eq 0 ]; then
+    :   # no tabs to scope to; the closing message explains, no header to print
+  elif [ "$MODE" = iterm ]; then
+    extra_win=""
+    [ "${NWINS:-1}" -gt 1 ] && \
+      extra_win=" ${C_DIM}($((NWINS - 1)) other iTerm2 window(s) not touched)${C_RST}"
+    echo "  iTerm2 window $WIN, $NTABS tab(s) -> tmux session '${C_CYAN}${TSESSION}${C_RST}':$extra_win"
+  else
+    echo "  ${C_DIM}No iTerm2 to ask — scanning CLI sessions machine-wide.${C_RST}"
+    echo "  Sessions -> tmux session '${C_CYAN}${TSESSION}${C_RST}':"
+  fi
   echo
-  while IFS=$'\t' read -r pid tty sid cwd self; do
-    if [ "$self" = 1 ] || [ "$KILL_OLD" -eq 0 ]; then
-      tag="${C_YEL}STAGE${C_RST}"; n_stage=$((n_stage + 1))
-    else
-      tag="${C_GRN}MOVE ${C_RST}"; n_move=$((n_move + 1))
-    fi
-    preview_wname "$cwd"; wname="$WNAME"
-    printf '  %b  %s%-8s%s pid %-6s %s->%s %s%s:%s%s\n' \
-      "$tag" "$C_DIM" "$tty" "$C_RST" "$pid" "$C_DIM" "$C_RST" \
-      "$C_CYAN" "$TSESSION" "$wname" "$C_RST"
-    printf '         %s%s  %s%s\n' "$C_DIM" "${cwd/#$HOME/$TILDE}" "$(title_of "$sid")" "$C_RST"
-  done <"$ROWS"
+
+  # One pass, in discovery order — tab 1, 2, 3… in iTerm2 mode — so the listing
+  # reads like the window you are looking at, with every tab accounted for.
+  while IFS=$'\t' read -r disp where pid tty sid cwd extra note; do
+    case "$disp" in
+      NONE)
+        n_none=$((n_none + 1))
+        printf '  %s--     %-8s %-8s %-6s %s%s\n' \
+          "$C_DIM" "$where" "$tty" "$extra" "$note" "$C_RST" ;;
+      MOVE|STAGE)
+        if [ "$disp" = MOVE ]; then tag="${C_GRN}MOVE ${C_RST}"; else tag="${C_YEL}STAGE${C_RST}"; fi
+        preview_wname "$cwd"; wname="$WNAME"
+        printf '  %b  %-8s %s%-8s%s pid %-6s %s->%s %s%s:%s%s\n' \
+          "$tag" "$where" "$C_DIM" "$tty" "$C_RST" "$pid" "$C_DIM" "$C_RST" \
+          "$C_CYAN" "$TSESSION" "$wname" "$C_RST"
+        if [ "$sid" != "-" ]; then
+          printf '           %s%s  %s%s\n' "$C_DIM" "${cwd/#$HOME/$TILDE}" "$(title_of "$sid")" "$C_RST"
+        elif [ "$note" = "self" ]; then
+          printf '           %s%s  this session%s\n' "$C_DIM" "${cwd/#$HOME/$TILDE}" "$C_RST"
+        else
+          printf '           %s%s  %sno registry record — will open the --resume picker%s\n' \
+            "$C_DIM" "${cwd/#$HOME/$TILDE}" "$C_YEL" "$C_RST"
+        fi ;;
+    esac
+  done < <(tail -n +2 "$ROWS")
 
   echo
-  echo "  ${C_GRN}MOVE${C_RST}  ($n_move) SIGTERMed, then relaunched as ${C_DIM}claude --resume <id>${C_RST}."
+  if [ "$n_move" -gt 0 ] || [ "$n_stage" -gt 0 ]; then
+    echo "  ${C_GRN}MOVE${C_RST}  ($n_move) SIGTERMed, then relaunched as ${C_DIM}claude --resume <id>${C_RST}."
+    echo "        The iTerm2 tab stays open — only the Claude process is stopped."
+  fi
   if [ "$n_stage" -gt 0 ]; then
     echo "  ${C_YEL}STAGE${C_RST} ($n_stage) window built, command typed but not entered — you quit the"
     echo "        original and press Enter. Never killed for you."
   fi
-  [ "$skipped_intmux" -gt 0 ] && \
-    echo "  ${C_DIM}SKIP  ($skipped_intmux) already in a tmux pane — not touched.${C_RST}"
-  [ "$skipped_notty" -gt 0 ] && \
-    echo "  ${C_DIM}SKIP  ($skipped_notty) no controlling terminal (editor extension / headless) — not touched.${C_RST}"
+
+  # Anything that exists but cannot be moved safely is named, not counted away.
+  awk -F'\t' -v dim="$C_DIM" -v red="$C_RED" -v rst="$C_RST" '
+    NR > 1 && $1 ~ /^SKIP:/ {
+      split($1, a, ":"); r = a[2]
+      if (r == "dup" || r == "notranscript" || r == "nosid") {
+        printf "  %swarn%s  pid %s (%s) — %s\n", red, rst, $3, $4, $8
+      } else { n[r]++ }
+    }
+    END {
+      lbl["tmux"]           = "already in a tmux pane"
+      lbl["claude-desktop"] = "Claude desktop app session, not in a terminal"
+      lbl["claude-vscode"]  = "VS Code extension session, not in a terminal"
+      lbl["stale"]          = "stale registry entry (process gone or pid reused)"
+      for (r in n) {
+        d = (r in lbl) ? lbl[r] : r
+        printf "  %sSKIP  (%d) %s — not touched.%s\n", dim, n[r], d, rst
+      }
+    }' "$ROWS"
 fi
 
-if [ "$LIST" -eq 1 ]; then
+if [ "$n_move" -eq 0 ] && [ "$n_stage" -eq 0 ]; then
   echo
-  echo "  Listing only. Run ${C_GRN}--go${C_RST} to perform it."
-  echo "  In-flight tool calls are lost; everything already in the transcript is restored."
+  if [ "$MODE" = iterm ] && [ "${NTABS:-0}" -eq 0 ]; then
+    echo "  iTerm2 is running but reported no readable tabs, so there is nothing"
+    echo "  to scope to. Not widening to a machine-wide scan on a guess — run"
+    echo "  ${C_DIM}claude2tmux --system${C_RST} if that is what you want."
+  elif [ "$MODE" = iterm ]; then
+    echo "  Nothing to move: no Claude session is running in this window's tabs."
+  else
+    echo "  Nothing to move: no Claude CLI session is running outside tmux."
+  fi
   echo
   exit 0
 fi
 
-if [ "$GO" -eq 0 ]; then
+if [ "$LIST" -eq 1 ] || [ "$GO" -eq 0 ]; then
   echo
-  echo "  Dry run (same as ${C_DIM}--list${C_RST}). Re-run with ${C_GRN}--go${C_RST} to perform it."
+  [ "$LIST" -eq 1 ] && echo "  Listing only. Run ${C_GRN}--go${C_RST} to perform it." \
+                    || echo "  Dry run (same as ${C_DIM}--list${C_RST}). Re-run with ${C_GRN}--go${C_RST} to perform it."
   echo "  In-flight tool calls are lost; everything already in the transcript is restored."
   echo
   exit 0
@@ -344,7 +672,7 @@ if ! tmux has-session -t "=$TSESSION" 2>/dev/null; then
 fi
 
 made=0
-while IFS=$'\t' read -r pid tty sid cwd self; do
+while IFS=$'\t' read -r d where pid tty sid cwd note; do
   wbase="${cwd##*/}"
   name=$(printf '%s' "$wbase" | tr -c '[:alnum:]_.-' '-' | cut -c1-18)
   # dedupe window names
@@ -353,28 +681,32 @@ while IFS=$'\t' read -r pid tty sid cwd self; do
     name="${base}-${n}"; n=$((n + 1))
   done
 
-  if [ "$self" != 1 ] && [ "$KILL_OLD" -eq 1 ]; then
+  if [ "$d" = MOVE ]; then
     kill -TERM "$pid" 2>/dev/null
     for _ in 1 2 3 4 5 6 7 8 9 10; do
       kill -0 "$pid" 2>/dev/null || break
       sleep 0.5
     done
     if kill -0 "$pid" 2>/dev/null; then
-      echo "  ${C_YEL}warn${C_RST} pid $pid ($tty) did not exit on SIGTERM — skipping, kill it manually"
+      echo "  ${C_YEL}warn${C_RST} pid $pid ($where, $tty) did not exit on SIGTERM — skipping, kill it manually"
       continue
     fi
   fi
 
   tmux new-window -d -t "=$TSESSION:" -n "$name" -c "$cwd"
-  tmux send-keys -t "=$TSESSION:$name" "$CLAUDE_BIN --resume $sid"
-  if [ "$self" = 1 ] || [ "$KILL_OLD" -eq 0 ]; then
-    echo "  ${C_YEL}staged${C_RST} window '$name' — quit the original on $tty, then press Enter there"
+  if [ "$sid" != "-" ]; then
+    tmux send-keys -t "=$TSESSION:$name" "$CLAUDE_BIN --resume $sid"
   else
+    tmux send-keys -t "=$TSESSION:$name" "$CLAUDE_BIN --resume"
+  fi
+  if [ "$d" = MOVE ]; then
     tmux send-keys -t "=$TSESSION:$name" C-m
-    echo "  ${C_GRN}moved${C_RST}  $tty -> $TSESSION:$name  (${cwd/#$HOME/$TILDE})"
+    echo "  ${C_GRN}moved${C_RST}  $where ($tty) -> $TSESSION:$name  (${cwd/#$HOME/$TILDE})"
+  else
+    echo "  ${C_YEL}staged${C_RST} $where -> window '$name' — quit the original on $tty, then press Enter there"
   fi
   made=$((made + 1))
-done <"$ROWS"
+done <"$PLAN"
 
 [ -n "$BOOTSTRAP" ] && [ "$made" -gt 0 ] && tmux kill-window -t "=$TSESSION:_bootstrap" 2>/dev/null
 
