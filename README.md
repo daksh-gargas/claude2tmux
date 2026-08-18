@@ -29,10 +29,23 @@ quit it yourself when it's idle.
 ## Install
 
 ```sh
-git clone https://github.com/daksh-gargas/claude2tmux.git
-cd claude2tmux
-install -m 755 claude2tmux /usr/local/bin/    # or anywhere on your PATH
+brew install daksh-gargas/tap/claude2tmux
 ```
+
+Or take the single file, which is all this is:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/daksh-gargas/claude2tmux/main/claude2tmux \
+  -o /usr/local/bin/claude2tmux && chmod +x /usr/local/bin/claude2tmux
+```
+
+The Homebrew line names the formula in full on purpose. Since Homebrew 6.0.0,
+loading a formula from a non-official tap requires trusting it first, because a
+formula is executable Ruby rather than metadata. Naming it in full *is* that
+grant — it trusts this one formula and installs it. The two-step
+`brew tap` + `brew install claude2tmux` form fails instead, asking you to run
+`brew trust`, because resolving a short name is exactly where a tap could hand
+you something you did not ask for.
 
 Optionally add a `c2t` shell function to `~/.zshrc`:
 

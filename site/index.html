@@ -96,8 +96,15 @@
     <h2>Install</h2>
 
     <h3>Homebrew</h3>
-    <div class="cmd"><span class="t-prompt">$</span> brew tap daksh-gargas/tap
-<span class="t-prompt">$</span> brew install claude2tmux</div>
+    <div class="cmd"><span class="t-prompt">$</span> brew install daksh-gargas/tap/claude2tmux</div>
+    <p class="sub">
+      The full <code>user/tap/formula</code> name is deliberate. Since Homebrew
+      6.0.0 a formula from a non-official tap has to be trusted before Homebrew
+      will load it — a formula is executable Ruby, not metadata — and naming it
+      in full <em>is</em> that grant, for this one formula. The two-step
+      <code>brew tap</code> + <code>brew install claude2tmux</code> form stops
+      with a <code>brew trust</code> error instead.
+    </p>
 
     <h3>Direct from GitHub</h3>
     <p class="sub">One file, no dependencies beyond tmux and python3.</p>
